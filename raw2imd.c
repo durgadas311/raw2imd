@@ -27,6 +27,20 @@
 	  http://www.fdutils.linux.lu/disk-id.html
 */
 
+/*
+ * simulator "logdisk" format e.g.
+ * "5m512z9p2s80t1d0i1l0h\n":
+ *	5" drive
+ *	512-byte sectors
+ *	9 spt
+ *	2 sides
+ *	80 tracks (cylinders)
+ *	1 density (DD)
+ *	0 interlace (side 1 placement)
+ *	1 logical skew (not relevant)
+ *	0 hard sectors (i.e. soft sectored)
+ */
+
 #include "disk.h"
 #include "imd.h"
 #include "util.h"
@@ -42,6 +56,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <errno.h>
 
 #ifndef PACKAGE_NAME
 #define PACKAGE_NAME "IMD"
@@ -58,6 +73,9 @@ static struct args {
 	int length_code;
 	int size;
 	int mfm;
+	int policy;	// 2-side policy
+	int skew;	// physical skew
+	int *sectbl;
 	int offset1;
 	int offset2;
 	int force;
@@ -66,22 +84,97 @@ static struct args {
 	const char *title;
 	const char *imd_filename;
 	const char *image_filename;
+	int logdisk;
 } args;
 
 static int dev_fd;
 
-static void read_track(track_t *track, int fd) {
+static int snoop_media(const char *file) {
+	int e;
+	char buf[128];
+	int fd = open(file, O_RDONLY);
+	if (fd < 0) return -1;
+	e = lseek(fd, -128L, SEEK_END);
+	if (e < 0) goto out;
+	e = read(fd, buf, sizeof(buf));
+	if (e < 0) goto out;
+	e = 0;
+	while (buf[e] != '\n' && buf[e] != '\0' && e < sizeof(buf)) {
+		int p = 0;
+		char *end;
+		p = strtoul(&buf[e], &end, 10);
+		switch (*end) {
+		case 'm':
+			args.size = p;
+			break;
+		case 'z':
+			args.length = p;
+			break;
+		case 'p':
+			args.sectors = p;
+			break;
+		case 's':
+			args.heads = p;
+			break;
+		case 't':
+			args.cylinders = p;
+			break;
+		case 'd':
+			args.mfm = p;
+			break;
+		case 'i':
+			args.policy = p;
+			break;
+		case 'l':
+			// args.skew = p; // logical skew - not used
+			break;
+		case 'h':
+			// ignore hard-sectoring?
+			break;
+		default:
+			errno = EINVAL;
+			e = -1;
+			goto out;
+		}
+		e = (end - buf) + 1;
+	}
+	if (args.policy == 2) { // special-case for Kaypro
+		if (args.offset1 < 0) args.offset1 = 0;
+		if (args.offset2 < 0) args.offset2 = args.sectors;
+	} else {
+		if (args.offset1 < 0) args.offset1 = 1;
+		// args.offset2 corrected later, if needed...
+	}
+	e = 0;
+out:
+	close(fd);
+	return e;
+}
+
+static void read_track(track_t *track, int cyl, int hd, int fd) {
 	int s;
 	// for now, assume image is:
 	// cyl 0 hd 0 sec 0-n
 	// cyl 0 hd 1 sec 0-n
 	// cyl 1 hd 0 sec 0-n
 	// ...
+#if 0
 	off_t o = lseek(fd, 0L, SEEK_CUR);
 	o = o / args.length;
 	o = o / args.sectors;
 	int cyl = o / args.heads;
 	int hd = o % args.heads;
+#endif
+	if (args.policy == 0) { // "continuation" side 0 first, then side 1
+		off_t o;
+		//o = (cyl * args.heads + hd) * args.sectors * args.length;
+		o = (hd * args.cylinders + cyl) * args.sectors * args.length;
+		o = lseek(fd, o, SEEK_SET);
+		if (o < 0) {
+			perror(args.image_filename);
+			exit(1);
+		}
+	}
 	// TODO: what are the right values here?
 	if (args.size == 8) {
 		track->data_mode = &DATA_MODES[5-args.mfm];	// "FM-500k" - "MFM-500k"
@@ -94,10 +187,15 @@ static void read_track(track_t *track, int fd) {
 	track->sector_size_code = args.length_code;
 	track->status = TRACK_PROBED;
 	for (s = 0; s < args.sectors; ++s) {
-		sector_t *sec = &track->sectors[s];
+		int sn = s;
+		if (args.skew > 1) {
+			sn = args.sectbl[s];
+		}
+		sector_t *sec = &track->sectors[sn];
 		sec->log_cyl = track->phys_cyl;
 		sec->log_head = track->phys_head;
-		// TODO: more complex translations
+		// TODO: more complex translations?
+		// raw images have sectors in numerical order...
 		sec->log_sector = s + (hd ? args.offset2 : args.offset1);
 		sec->deleted = false;
 		sec->status = SECTOR_GOOD;
@@ -123,6 +221,9 @@ static void process_raw(void) {
 	}
 	fstat(dev_fd, &stb);
 	int cap = args.cylinders * args.heads * args.sectors * args.length;
+	if (args.logdisk) {
+		stb.st_size -= 128;
+	}
 	if (!args.ignore && stb.st_size > cap) {
 		die("image file too large: %s", args.image_filename);
 	}
@@ -179,7 +280,7 @@ static void process_raw(void) {
 		for (int head = 0; head < disk.num_phys_heads; head++) {
 			track_t *track = &(disk.tracks[cyl][head]);
 
-			read_track(track, dev_fd);
+			read_track(track, cyl, head, dev_fd);
 
 			if (image != NULL) {
 				write_imd_track(track, image);
@@ -203,13 +304,17 @@ static void usage(void) {
 	fprintf(stderr, "  -h NUM	 number of heads (sides)\n");
 	fprintf(stderr, "  -s NUM	 number of sectors/track\n");
 	fprintf(stderr, "  -l NUM	 sectors length\n");
-	fprintf(stderr, "  -o		 sector number offset (0)\n");
+	fprintf(stderr, "  -k NUM	 physical sector skew\n");
+	fprintf(stderr, "  -K NUM	 side 1 physical skew\n");
+	fprintf(stderr, "  -o		 sector number offset (1)\n");
 	fprintf(stderr, "  -O		 side 1 sector number offset (-o)\n");
 	fprintf(stderr, "  -m		 raw represents MFM (double density)\n");
 	fprintf(stderr, "  -i		 ignore extra data in raw file\n");
 	fprintf(stderr, "  -f		 force using smaller raw file\n");
 	fprintf(stderr, "  -C		 read comment from stdin\n");
 	fprintf(stderr, "  -T STR	 use STR as comment\n");
+	fprintf(stderr, "  -L		 raw is logdisk format\n");
+	fprintf(stderr, "  -v		 verbose output\n");
 }
 
 int main(int argc, char **argv) {
@@ -224,15 +329,19 @@ int main(int argc, char **argv) {
 	args.offset1 = -1;
 	args.offset2 = -1;
 	args.mfm = 0;	// need numeric values 0/1
+	args.policy = 1; // default to "interlaced"
+	args.skew = 0;	// physical skew
+	args.sectbl = NULL;
 	args.force = false;
 	args.ignore = false;
 	args.read_comment = false;
 	args.title = NULL;
 	args.imd_filename = NULL;
 	args.image_filename = NULL;
+	args.logdisk = false;
 
 	while (true) {
-		int opt = getopt(argc, argv, "58c:h:s:l:o:O:mifCT:");
+		int opt = getopt(argc, argv, "58c:h:s:l:o:O:mifCT:Lk:K:");
 		if (opt == -1) break;
 
 		switch (opt) {
@@ -275,9 +384,42 @@ int main(int argc, char **argv) {
 		case 'T':
 			args.title = optarg;
 			break;
+		case 'L':
+			args.logdisk = true;
+			break;
+		case 'k':
+			args.skew = atoi(optarg);
+			break;
+		case 'K':
+			//args.skew2 = atoi(optarg);
+			break;
 		default:
 			usage();
 			return 1;
+		}
+	}
+
+	x = optind;
+	if (x == argc) {
+		// raw file missing - or no arguments
+		usage();
+		return 0;
+	}
+	args.image_filename = argv[x++];
+	if (x == argc) {
+		// No image file.
+	} else if (x + 1 == argc) {
+		args.imd_filename = argv[x++];
+	} else {
+		usage();
+		return 1;
+	}
+
+	if (args.logdisk) {
+		x = snoop_media(args.image_filename);
+		if (x < 0) {
+			perror(args.image_filename);
+			exit(1);
 		}
 	}
 	if (args.cylinders < 0 || args.heads < 0 ||
@@ -298,26 +440,19 @@ int main(int argc, char **argv) {
 		args.size = 5;
 	}
 	if (args.offset1 < 0) {
-		args.offset1 = 0;
+		args.offset1 = 1; // default to industry-standard
 	}
 	if (args.offset2 < 0) {
 		args.offset2 = args.offset1;
 	}
-
-	x = optind;
-	if (x == argc) {
-		// raw file missing - or no arguments
-		usage();
-		return 0;
-	}
-	args.image_filename = argv[x++];
-	if (x == argc) {
-		// No image file.
-	} else if (x + 1 == argc) {
-		args.imd_filename = argv[x++];
-	} else {
-		usage();
-		return 1;
+	if (args.skew > 1) { // physical skew - if specified
+		args.sectbl = malloc(args.sectors * sizeof(*args.sectbl));
+		int s;
+		for (s = 0; s < args.sectors; ++s) {
+			int sn = s;
+			sn = (s * args.skew) % args.sectors;
+			args.sectbl[sn] = s;
+		}
 	}
 
 	process_raw();
