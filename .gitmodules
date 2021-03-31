@@ -1,0 +1,3 @@
+[submodule "dumpfloppy"]
+	path = dumpfloppy
+	url = http://offog.org/git/dumpfloppy.git
