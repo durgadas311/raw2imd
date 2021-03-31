@@ -44,6 +44,7 @@
 #include "disk.h"
 #include "imd.h"
 #include "util.h"
+#include "show.h"
 
 #include <fcntl.h>
 #include <stdbool.h>
@@ -74,10 +75,10 @@ static struct args {
 	int size;
 	int mfm;
 	int policy;	// 2-side policy
-	int skew;	// physical skew
-	int *sectbl;
-	int offset1;
-	int offset2;
+	int *sectbl;	// physical skew table
+	int *sectbl2;	// side 2
+	int offset1;	// first sector number/offset
+	int offset2;	// side 2
 	int force;
 	int ignore;
 	bool read_comment;
@@ -85,6 +86,7 @@ static struct args {
 	const char *imd_filename;
 	const char *image_filename;
 	int logdisk;
+	int verbose;
 } args;
 
 static int dev_fd;
@@ -187,8 +189,10 @@ static void read_track(track_t *track, int cyl, int hd, int fd) {
 	track->sector_size_code = args.length_code;
 	track->status = TRACK_PROBED;
 	for (s = 0; s < args.sectors; ++s) {
-		int sn = s;
-		if (args.skew > 1) {
+		int sn = s;	// assume no skew (1:1)
+		if (hd > 0 && args.sectbl2 != NULL) {
+			sn = args.sectbl2[s];
+		} else if (args.sectbl != NULL) {
 			sn = args.sectbl[s];
 		}
 		sector_t *sec = &track->sectors[sn];
@@ -292,33 +296,60 @@ static void process_raw(void) {
 	if (image != NULL) {
 		fclose(image);
 	}
-	free_disk(&disk);
 	close(dev_fd);
+	if (args.verbose) {
+		show_disk(&disk, args.verbose > 1, stdout);
+	}
+	free_disk(&disk);
+}
+
+/*
+ * Creates the physical sector skew table needed to
+ * determine track->sectors[x] when reading sequential
+ * sectors from the raw image file.
+ * Raw image files contain physical sectors in order:
+ * 1,2,3,4,5,6,7,8,9 (spt=9)
+ * This table places the sectors into the actual order
+ * they should appear on the disk, e.g. with skew=7:
+ * 1,8,6,4,2,9,7,5,3 (spt=9)
+ * when using &track->sectors[tbl[s]] (s: 0 <= s < spt).
+ */
+static int *mkskew(int skew, int secs) {
+	int *tbl = malloc(secs * sizeof(int));
+	int s;
+	for (s = 0; s < secs; ++s) {
+		int sn = s;
+		sn = (s * skew) % secs;
+		tbl[sn] = s;
+	}
+	return tbl;
 }
 
 static void usage(void) {
 	fprintf(stderr, "usage: raw2imd [OPTION]... RAW-FILE [IMAGE-FILE]\n");
-	fprintf(stderr, "  -5		 raw represents 5.25\" diskette (default)\n");
-	fprintf(stderr, "  -8		 raw represents 8\" diskette\n");
+	fprintf(stderr, "  -5		 RAW-FILE represents 5.25\" diskette (default)\n");
+	fprintf(stderr, "  -8		 RAW-FILE represents 8\" diskette\n");
 	fprintf(stderr, "  -c NUM	 number of cylinders\n");
 	fprintf(stderr, "  -h NUM	 number of heads (sides)\n");
 	fprintf(stderr, "  -s NUM	 number of sectors/track\n");
 	fprintf(stderr, "  -l NUM	 sectors length\n");
-	fprintf(stderr, "  -k NUM	 physical sector skew\n");
-	fprintf(stderr, "  -K NUM	 side 1 physical skew\n");
+	fprintf(stderr, "  -m		 RAW-FILE represents MFM (double density)\n");
+	fprintf(stderr, "  -L		 RAW-FILE is logdisk format (has geom)\n");
 	fprintf(stderr, "  -o		 sector number offset (1)\n");
 	fprintf(stderr, "  -O		 side 1 sector number offset (-o)\n");
-	fprintf(stderr, "  -m		 raw represents MFM (double density)\n");
-	fprintf(stderr, "  -i		 ignore extra data in raw file\n");
-	fprintf(stderr, "  -f		 force using smaller raw file\n");
+	fprintf(stderr, "  -k NUM	 physical sector skew (1)\n");
+	fprintf(stderr, "  -K NUM	 side 1 physical skew (-k)\n");
+	fprintf(stderr, "  -i		 ignore extra data in RAW-FILE\n");
+	fprintf(stderr, "  -f		 force using smaller RAW-FILE\n");
 	fprintf(stderr, "  -C		 read comment from stdin\n");
 	fprintf(stderr, "  -T STR	 use STR as comment\n");
-	fprintf(stderr, "  -L		 raw is logdisk format\n");
-	fprintf(stderr, "  -v		 verbose output\n");
+	fprintf(stderr, "  -v		 verbose output (multiple)\n");
 }
 
 int main(int argc, char **argv) {
 	int x;
+	int skew = -1;
+	int skew2 = -1;
 
 	dev_fd = -1;
 	args.cylinders = -1;
@@ -330,8 +361,8 @@ int main(int argc, char **argv) {
 	args.offset2 = -1;
 	args.mfm = 0;	// need numeric values 0/1
 	args.policy = 1; // default to "interlaced"
-	args.skew = 0;	// physical skew
 	args.sectbl = NULL;
+	args.sectbl2 = NULL;
 	args.force = false;
 	args.ignore = false;
 	args.read_comment = false;
@@ -339,9 +370,10 @@ int main(int argc, char **argv) {
 	args.imd_filename = NULL;
 	args.image_filename = NULL;
 	args.logdisk = false;
+	args.verbose = 0;
 
 	while (true) {
-		int opt = getopt(argc, argv, "58c:h:s:l:o:O:mifCT:Lk:K:");
+		int opt = getopt(argc, argv, "58c:h:s:l:o:O:mifCT:Lk:K:v");
 		if (opt == -1) break;
 
 		switch (opt) {
@@ -388,10 +420,13 @@ int main(int argc, char **argv) {
 			args.logdisk = true;
 			break;
 		case 'k':
-			args.skew = atoi(optarg);
+			skew = atoi(optarg);
 			break;
 		case 'K':
-			//args.skew2 = atoi(optarg);
+			skew2 = atoi(optarg);
+			break;
+		case 'v':
+			++args.verbose;
 			break;
 		default:
 			usage();
@@ -445,14 +480,11 @@ int main(int argc, char **argv) {
 	if (args.offset2 < 0) {
 		args.offset2 = args.offset1;
 	}
-	if (args.skew > 1) { // physical skew - if specified
-		args.sectbl = malloc(args.sectors * sizeof(*args.sectbl));
-		int s;
-		for (s = 0; s < args.sectors; ++s) {
-			int sn = s;
-			sn = (s * args.skew) % args.sectors;
-			args.sectbl[sn] = s;
-		}
+	if (skew > 1) { // physical skew - if specified
+		args.sectbl = mkskew(skew, args.sectors);
+	}
+	if (skew2 > 1) {
+		args.sectbl2 = mkskew(skew2, args.sectors);
 	}
 
 	process_raw();
