@@ -46,6 +46,15 @@
 #include "util.h"
 #include "show.h"
 
+/* derived from disk.c */
+#define MFM_250K	0	// 5.25" DD
+#define FM_250K		1	// 5.25" SD
+#define MFM_300K	2	// (DD media in 5.25" HD drives)
+#define FM_300K		3	// ('')
+#define MFM_500K	4	// 8" DD (5.25" HD, 3.5" HD)
+#define FM_500K		5	// 8" SD (5.25" HD, 3.5" HD)
+#define MFM_1000K	6	// 3.5" ED
+
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -74,6 +83,7 @@ static struct args {
 	int length_code;
 	int size;
 	int mfm;
+	int dmode;	// data mode, for DATA_MODES[]
 	int policy;	// 2-side policy
 	int *sectbl;	// physical skew table
 	int *sectbl2;	// side 2
@@ -177,12 +187,7 @@ static void read_track(track_t *track, int cyl, int hd, int fd) {
 			exit(1);
 		}
 	}
-	// TODO: what are the right values here?
-	if (args.size == 8) {
-		track->data_mode = &DATA_MODES[5-args.mfm];	// "FM-500k" - "MFM-500k"
-	} else {
-		track->data_mode = &DATA_MODES[3-args.mfm];	// "FM-300k" - "MFM-300k"
-	}
+	track->data_mode = &DATA_MODES[args.dmode];
 	track->phys_cyl = cyl;
 	track->phys_head = hd;
 	track->num_sectors = args.sectors;
@@ -327,19 +332,20 @@ static int *mkskew(int skew, int secs) {
 
 static void usage(void) {
 	fprintf(stderr, "usage: raw2imd [OPTION]... RAW-FILE [IMAGE-FILE]\n");
-	fprintf(stderr, "  -5		 RAW-FILE represents 5.25\" diskette (default)\n");
-	fprintf(stderr, "  -8		 RAW-FILE represents 8\" diskette\n");
+	fprintf(stderr, "  -5		 RAW-FILE is 5.25\" diskette (default)\n");
+	fprintf(stderr, "  -8		 RAW-FILE is 8\" diskette\n");
 	fprintf(stderr, "  -c NUM	 number of cylinders\n");
 	fprintf(stderr, "  -h NUM	 number of heads (sides)\n");
 	fprintf(stderr, "  -s NUM	 number of sectors/track\n");
-	fprintf(stderr, "  -l NUM	 sectors length\n");
-	fprintf(stderr, "  -m		 RAW-FILE represents MFM (double density)\n");
+	fprintf(stderr, "  -l NUM	 sector length\n");
+	fprintf(stderr, "  -m		 RAW-FILE is MFM (i.e. double density)\n");
+	fprintf(stderr, "  -r NUM	 override data rate [250,300,500]\n");
 	fprintf(stderr, "  -L		 RAW-FILE is logdisk format (has geom)\n");
 	fprintf(stderr, "  -o		 sector number offset (1)\n");
 	fprintf(stderr, "  -O		 side 1 sector number offset (-o)\n");
 	fprintf(stderr, "  -k NUM	 physical sector skew (1)\n");
 	fprintf(stderr, "  -K NUM	 side 1 physical skew (-k)\n");
-	fprintf(stderr, "  -i		 ignore extra data in RAW-FILE\n");
+	fprintf(stderr, "  -i		 ignore excess data in RAW-FILE\n");
 	fprintf(stderr, "  -f		 force using smaller RAW-FILE\n");
 	fprintf(stderr, "  -C		 read comment from stdin\n");
 	fprintf(stderr, "  -T STR	 use STR as comment\n");
@@ -350,6 +356,7 @@ int main(int argc, char **argv) {
 	int x;
 	int skew = -1;
 	int skew2 = -1;
+	int data_rate = -1;
 
 	dev_fd = -1;
 	args.cylinders = -1;
@@ -360,6 +367,7 @@ int main(int argc, char **argv) {
 	args.offset1 = -1;
 	args.offset2 = -1;
 	args.mfm = 0;	// need numeric values 0/1
+	args.dmode = -1; // index into DATA_MODES[]
 	args.policy = 1; // default to "interlaced"
 	args.sectbl = NULL;
 	args.sectbl2 = NULL;
@@ -373,7 +381,7 @@ int main(int argc, char **argv) {
 	args.verbose = 0;
 
 	while (true) {
-		int opt = getopt(argc, argv, "58c:h:s:l:o:O:mifCT:Lk:K:v");
+		int opt = getopt(argc, argv, "58c:h:s:l:o:O:mr:ifCT:Lk:K:v");
 		if (opt == -1) break;
 
 		switch (opt) {
@@ -404,6 +412,13 @@ int main(int argc, char **argv) {
 		case 'm':
 			args.mfm = 1;
 			break;
+		case 'r':	// data rate (250/300/500kbps)
+			data_rate = atoi(optarg);
+			if (data_rate != 250 && data_rate != 300 &&
+					data_rate != 500 && data_rate != 1000) {
+				goto error;
+			}
+			break;
 		case 'i':
 			args.ignore = true;
 			break;
@@ -429,6 +444,7 @@ int main(int argc, char **argv) {
 			++args.verbose;
 			break;
 		default:
+error:
 			usage();
 			return 1;
 		}
@@ -473,6 +489,29 @@ int main(int argc, char **argv) {
 	}
 	if (args.size < 0) {
 		args.size = 5;
+	}
+	if (data_rate < 0) {
+		if (args.size == 8) {
+			args.dmode = args.mfm ? MFM_500K : FM_500K;
+		} else if (args.size == 5) {
+			args.dmode = args.mfm ? MFM_250K : FM_250K;
+		} else {
+			args.dmode = MFM_250K; // punt
+		}
+	} else switch (data_rate) {
+		case 250:
+			args.dmode = args.mfm ? MFM_250K : FM_250K;
+			break;
+		case 300:
+			args.dmode = args.mfm ? MFM_300K : FM_300K;
+			break;
+		case 500:
+			args.dmode = args.mfm ? MFM_500K : FM_500K;
+			break;
+		case 1000:
+			args.dmode = MFM_1000K;
+			args.mfm = 1;
+			break;
 	}
 	if (args.offset1 < 0) {
 		args.offset1 = 1; // default to industry-standard
