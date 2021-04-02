@@ -135,6 +135,11 @@ static int snoop_media(const char *file) {
 			args.mfm = p;
 			break;
 		case 'i':
+// Policy for second side:
+// 0: wrap        0.0 1.0 2.0 ...39.0 39.1 38.1 37.1...
+// 1: interlace   0.0 0.1 1.0 1.1 ...
+// 2: kaypro, interlace but side 1 sectors start at 10
+//    (also, first sector is "0")
 			args.policy = p;
 			break;
 		case 'l':
@@ -315,16 +320,28 @@ static void process_raw(void) {
  * Raw image files contain physical sectors in order:
  * 1,2,3,4,5,6,7,8,9 (spt=9)
  * This table places the sectors into the actual order
- * they should appear on the disk, e.g. with skew=7:
+ * they should appear on the disk, e.g. with skew=4:
  * 1,8,6,4,2,9,7,5,3 (spt=9)
  * when using &track->sectors[tbl[s]] (s: 0 <= s < spt).
  */
 static int *mkskew(int skew, int secs) {
 	int *tbl = malloc(secs * sizeof(int));
+	memset(tbl, 0xff, secs * sizeof(int)); // -1
+	int nudge = 1;
+	if (skew < 0) {
+		skew = -skew;
+		nudge = -1;
+	}
 	int s;
 	for (s = 0; s < secs; ++s) {
 		int sn = s;
 		sn = (s * skew) % secs;
+		// handle skew that is factor of secs
+		while (tbl[sn] >= 0) {
+			sn += nudge;
+			if (sn < 0) sn = secs - 1;
+			if (sn >= secs) sn = 0;
+		}
 		tbl[sn] = s;
 	}
 	return tbl;
@@ -519,10 +536,10 @@ error:
 	if (args.offset2 < 0) {
 		args.offset2 = args.offset1;
 	}
-	if (skew > 1) { // physical skew - if specified
+	if (abs(skew) > 1) { // physical skew - if specified
 		args.sectbl = mkskew(skew, args.sectors);
 	}
-	if (skew2 > 1) {
+	if (abs(skew2) > 1) {
 		args.sectbl2 = mkskew(skew2, args.sectors);
 	}
 
