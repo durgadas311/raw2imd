@@ -207,7 +207,11 @@ static void read_track(track_t *track, int cyl, int hd, int fd) {
 		}
 		sector_t *sec = &track->sectors[sn];
 		sec->log_cyl = track->phys_cyl;
-		sec->log_head = track->phys_head;
+		if (args.policy == 2) {
+			sec->log_head = 0;	// Kaypro special
+		} else {
+			sec->log_head = track->phys_head;
+		}
 		// TODO: more complex translations?
 		// raw images have sectors in numerical order...
 		sec->log_sector = s + (hd ? args.offset2 : args.offset1);
@@ -328,14 +332,15 @@ static int *mkskew(int skew, int secs) {
 	int *tbl = malloc(secs * sizeof(int));
 	memset(tbl, 0xff, secs * sizeof(int)); // -1
 	int nudge = 1;
-	if (skew < 0) {
-		skew = -skew;
+	int sk = skew;
+	if (sk < 0) {
+		sk = -sk;
 		nudge = -1;
 	}
 	int s;
 	for (s = 0; s < secs; ++s) {
 		int sn = s;
-		sn = (s * skew) % secs;
+		sn = (s * sk) % secs;
 		// handle skew that is factor of secs
 		while (tbl[sn] >= 0) {
 			sn += nudge;
@@ -343,6 +348,13 @@ static int *mkskew(int skew, int secs) {
 			if (sn >= secs) sn = 0;
 		}
 		tbl[sn] = s;
+	}
+	if (0) {
+		printf("skew(%d) = {", skew);
+		for (s = 0; s < secs; ++s) {
+			printf(" %d", tbl[s]);
+		}
+		printf(" }\n");
 	}
 	return tbl;
 }
@@ -398,7 +410,7 @@ int main(int argc, char **argv) {
 	args.verbose = 0;
 
 	while (true) {
-		int opt = getopt(argc, argv, "58c:h:s:l:o:O:mr:ifCT:Lk:K:v");
+		int opt = getopt(argc, argv, "58p:c:h:s:l:o:O:mr:ifCT:Lk:K:v");
 		if (opt == -1) break;
 
 		switch (opt) {
@@ -407,6 +419,9 @@ int main(int argc, char **argv) {
 			break;
 		case '8':
 			args.size = 8;
+			break;
+		case 'p':
+			args.policy = atoi(optarg);
 			break;
 		case 'c':
 			args.cylinders = atoi(optarg);
