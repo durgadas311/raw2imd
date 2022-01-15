@@ -330,6 +330,7 @@ static void process_raw(void) {
  */
 static int *mkskew(int skew, int secs) {
 	int *tbl = malloc(secs * sizeof(int));
+	int *tbl_out = malloc(secs * sizeof(int));
 	memset(tbl, 0xff, secs * sizeof(int)); // -1
 	int nudge = 1;
 	int sk = skew;
@@ -348,15 +349,17 @@ static int *mkskew(int skew, int secs) {
 			if (sn >= secs) sn = 0;
 		}
 		tbl[sn] = s;
+		tbl_out[s] = sn;
 	}
+	free(tbl);
 	if (0) {
 		printf("skew(%d) = {", skew);
 		for (s = 0; s < secs; ++s) {
-			printf(" %d", tbl[s]);
+			printf(" %d", tbl_out[s]);
 		}
 		printf(" }\n");
 	}
-	return tbl;
+	return tbl_out;
 }
 
 static void usage(void) {
