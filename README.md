@@ -5,6 +5,19 @@
 
 Invoking 'raw2imd' with no arguments will print help information.
 
+#### Example: Kaypro DD/DS (400K)
+
+Using a "plain" raw disk image, and creating the Kaypro physical sector skew,
+the command would be:
+```
+raw2imd -c 40 -h 2 -s 10 -l 512 -m -o 0 -O 10 -p 2 -k -4 -T "Some Title" mydisk.raw mydisk.imd
+```
+
+Using a Kaypro simulator "logdisk" image, the same command would be:
+```
+raw2imd -L -k -4 -T "Some Title" mydisk.logdisk mydisk.imd
+```
+
 ### Features
 
 'raw2imd' supports basic "flat" sector images. Such files
